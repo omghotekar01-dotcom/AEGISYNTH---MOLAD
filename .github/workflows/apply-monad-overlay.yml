@@ -1,0 +1,46 @@
+name: Apply verified Monad integration once
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-monad-overlay.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Validate and apply Monad Testnet integration kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .aegisynth-base-imported || { echo "Original code import must finish first"; exit 1; }
+          if test -f .aegisynth-monad-applied; then
+            echo "Integration already applied; no files changed."
+            exit 0
+          fi
+          test -s .bootstrap/monad-overlay.b64
+          base64 --decode .bootstrap/monad-overlay.b64 > "$RUNNER_TEMP/monad-overlay.tar.xz"
+          echo '7254f4b4f08d93a4eb1cc20f4f0180d711b1faa9a80ac709339af1eae82c5c7a  '"$RUNNER_TEMP/monad-overlay.tar.xz" | sha256sum -c -
+          python3 - "$RUNNER_TEMP/monad-overlay.tar.xz" <<'PY'
+          import sys,tarfile,pathlib
+          with tarfile.open(sys.argv[1], 'r:xz') as t:
+              for member in t.getmembers():
+                  p=pathlib.PurePosixPath(member.name)
+                  if member.issym() or member.islnk() or member.isdev() or p.is_absolute() or '..' in p.parts:
+                      raise SystemExit('Unsafe entry in integration archive: '+member.name)
+          PY
+          tar -xJf "$RUNNER_TEMP/monad-overlay.tar.xz" -C .
+          rm -f .bootstrap/monad-overlay.b64
+          rmdir .bootstrap || true
+          printf '%s\n' 'Monad integration applied from audited archive SHA-256 7254f4b4f08d93a4eb1cc20f4f0180d711b1faa9a80ac709339af1eae82c5c7a.' > .aegisynth-monad-applied
+          git config user.name 'Om Ghotekar'
+          git config user.email 'omghotekar01@gmail.com'
+          git add -A
+          git diff --cached --quiet && { echo 'Nothing to commit'; exit 0; }
+          git commit -m 'feat: integrate governed Monad payment vault and security demo'
+          git push origin HEAD:main
