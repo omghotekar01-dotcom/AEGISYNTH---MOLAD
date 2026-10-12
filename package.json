@@ -1,0 +1,25 @@
+{
+  "name": "aegisynth-monad-metropolis",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Aegisynth governed defence compiler + human-approved Monad payment vault, testnet only",
+  "scripts": {
+    "contracts:compile": "hardhat compile",
+    "contracts:test": "hardhat test",
+    "contracts:deploy:testnet": "hardhat run scripts/deploy.cjs --network monadTestnet",
+    "demo:check": "node --test test/policy-evidence.test.mjs && node --check web3/app.js && node --check scripts/deploy.cjs",
+    "web3:dev": "vite web3 --host 127.0.0.1",
+    "web3:build": "vite build web3 --outDir ../web3-dist",
+    "test": "npm run demo:check && npm run contracts:test"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
+    "@nomicfoundation/hardhat-ethers": "^3.1.0",
+    "chai": "^4.5.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.15.0",
+    "hardhat": "^2.26.3",
+    "vite": "^6.3.0",
+    "viem": "^2.37.4"
+  }
+}
