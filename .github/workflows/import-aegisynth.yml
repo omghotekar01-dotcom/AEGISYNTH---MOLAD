@@ -1,0 +1,58 @@
+name: Import AEGISYNTH source once
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-aegisynth.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import-base:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout independent Metropolis repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Import public AEGISYNTH source with no credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f .aegisynth-base-imported; then
+            echo "Original source already imported; not overwriting the working project."
+            exit 0
+          fi
+          git clone --depth 1 --filter=blob:none https://github.com/omghotekar01-dotcom/Mastercard-project---AEGISYNTH.git "$RUNNER_TEMP/aegis-base"
+          rsync -a --exclude='.git/' "$RUNNER_TEMP/aegis-base/" ./
+          printf '%s\n' 'Imported from omghotekar01-dotcom/Mastercard-project---AEGISYNTH at 2026-10-12 for Metropolis. Source authorship and original repository remain unchanged.' > .aegisynth-base-imported
+          cat >> .gitignore <<'EOF'
+
+          # Monad testnet private key and generated artifacts
+          .env
+          .env.*
+          !.env.example
+          !*.env.example
+          node_modules/
+          artifacts/
+          cache/
+          web3-dist/
+          coverage/
+          *.log
+          EOF
+          cat > README_METROPOLIS.md <<'EOF'
+          # AEGISYNTH Sentinel — Metropolis / Monad Testnet
+
+          This repository imports the public [original AEGISYNTH fraud-defence research prototype](https://github.com/omghotekar01-dotcom/Mastercard-project---AEGISYNTH), preserving its original source, and extends it toward an owner-governed testnet MON payment vault.
+
+          The existing synthetic fraud compiler generates a human-review package; it does **not** authorize or automatically deploy payment rules. The new vault must enforce explicit owner/reviewer/operator constraints on chain. Do not transfer real assets, expose private keys, or claim production fraud protection.
+
+          Deployment is **not confirmed** until contract tests pass and MonadVision shows a verified testnet transaction receipt.
+          EOF
+          git config user.name 'Om Ghotekar'
+          git config user.email 'omghotekar01@gmail.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: import AEGISYNTH research engine for Monad Sentinel [skip ci]"
+            git push origin HEAD:main
+          fi
