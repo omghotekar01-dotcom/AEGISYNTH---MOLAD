@@ -1,0 +1,251 @@
+from fastapi.testclient import TestClient
+
+import app.main as main_module
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health_readiness_and_dashboard():
+    health = client.get('/health')
+    assert health.status_code == 200
+    assert health.json()['status'] == 'ok'
+
+    ready = client.get('/ready')
+    assert ready.status_code == 200
+    ready_data = ready.json()
+    assert ready_data['status'] == 'ready'
+    assert ready_data['checks']['dashboard_present'] is True
+    assert ready_data['checks']['z3_formal_verifier_available'] is True
+    assert ready_data['checks']['z3_formal_verifier_operational'] is True
+    assert ready_data['formal_verifier'] == 'z3'
+
+    page = client.get('/')
+    assert page.status_code == 200
+    assert 'AEGISYNTH' in page.text
+
+
+def test_readiness_fails_closed_without_formal_verifier(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', False)
+    res = client.get('/ready')
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'not_ready'
+    assert data['checks']['z3_formal_verifier_available'] is False
+    assert data['checks']['z3_formal_verifier_operational'] is False
+    assert data['formal_verifier'] == 'unavailable'
+
+
+def test_readiness_fails_closed_when_formal_verifier_runtime_breaks(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', True)
+    monkeypatch.setattr(main_module, 'verify_policy', lambda _policy: (False, ['runtime failure']))
+
+    res = client.get('/ready')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'not_ready'
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is False
+    assert data['formal_verifier'] == 'unavailable'
+
+
+def test_readiness_fails_closed_when_formal_verifier_raises(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', True)
+
+    def broken_verifier(_policy):
+        raise RuntimeError('solver unavailable')
+
+    monkeypatch.setattr(main_module, 'verify_policy', broken_verifier)
+
+    res = client.get('/ready')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'not_ready'
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is False
+    assert data['formal_verifier'] == 'unavailable'
+
+
+def test_readiness_fails_closed_without_dashboard(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module, 'STATIC_DIR', tmp_path)
+    res = client.get('/ready')
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'not_ready'
+    assert data['checks']['dashboard_present'] is False
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is True
+    assert data['formal_verifier'] == 'z3'
+
+
+def test_meta_is_explicitly_synthetic_and_governed():
+    res = client.get('/api/v1/meta')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['production_claim'] is False
+    assert data['benchmark_seed'] == 42
+    assert set(data['responsible_actions']) == {'STEP_UP', 'REVIEW'}
+    assert 'synthetic' in data['scope'].lower()
+
+
+def test_reproducible_demo_matches_committed_benchmark():
+    res = client.get('/api/v1/demo')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['seed'] == 42
+    assert data['attack_family'] == 'ghost_merchant_swarm'
+    assert len(data['iterations']) == 4
+    assert data['baseline_attack_success_rate'] == 0.5383
+    assert data['final_attack_success_rate'] == 0.0743
+    assert data['metrics']['final_fraud_coverage'] == 0.9257
+    assert data['metrics']['benign_acceptance_rate'] == 0.9943
+    assert data['final_policy']['verified'] is True
+    assert data['final_policy']['action'] in {'STEP_UP', 'REVIEW'}
+
+
+def test_reproducible_demo_fails_closed_with_structured_503(monkeypatch):
+    def broken_benchmark():
+        raise RuntimeError('sensitive benchmark internals')
+
+    monkeypatch.setattr(main_module, '_benchmark', broken_benchmark)
+
+    res = client.get('/api/v1/demo')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['detail'] == {
+        'status': 'unavailable',
+        'reason': 'benchmark_replay_failed',
+        'scope': 'synthetic defensive payment-security laboratory',
+    }
+    assert 'sensitive benchmark internals' not in res.text
+
+
+def test_review_package_fails_closed_with_structured_503(monkeypatch):
+    def broken_package_builder(_result):
+        raise RuntimeError('sensitive solver internals')
+
+    monkeypatch.setattr(main_module, 'build_review_package', broken_package_builder)
+
+    res = client.get('/api/v1/review-package')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['detail'] == {
+        'status': 'unavailable',
+        'reason': 'review_package_verification_failed',
+        'scope': 'synthetic defensive payment-security laboratory',
+    }
+    assert 'sensitive solver internals' not in res.text
+
+
+def test_runtime_self_check_passes_all_contracts():
+    res = client.get('/api/v1/self-check')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['status'] == 'pass'
+    assert data['checks']
+    assert data['checks']['attack_family'] is True
+    assert data['checks']['generation_count'] is True
+    assert data['checks']['artifact_seed'] is True
+    assert data['checks']['artifact_attack_family'] is True
+    assert data['checks']['artifact_generation_count'] is True
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is True
+    assert all(data['checks'].values())
+    assert 'synthetic' in data['scope'].lower()
+
+
+def test_runtime_self_check_reports_structured_503_when_benchmark_runtime_raises(monkeypatch):
+    def broken_benchmark():
+        raise RuntimeError('benchmark unavailable')
+
+    def verifier_must_not_run():
+        raise AssertionError('self-check must stop after benchmark runtime failure')
+
+    monkeypatch.setattr(main_module, '_benchmark', broken_benchmark)
+    monkeypatch.setattr(main_module, '_formal_verifier_operational', verifier_must_not_run)
+
+    res = client.get('/api/v1/self-check')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'fail'
+    assert data['checks'] == {'benchmark_runtime_operational': False}
+    assert 'synthetic' in data['scope'].lower()
+
+
+def test_runtime_self_check_fails_closed_on_generation_provenance_drift(monkeypatch):
+    benchmark = main_module._benchmark()
+    monkeypatch.setattr(main_module, '_benchmark', lambda: benchmark)
+    monkeypatch.setattr(main_module, 'BENCHMARK_GENERATIONS', len(benchmark.iterations) - 1)
+
+    res = client.get('/api/v1/self-check')
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'fail'
+    assert data['checks']['generation_count'] is False
+    assert data['checks']['artifact_generation_count'] is False
+
+
+def test_runtime_self_check_fails_closed_without_formal_verifier(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', False)
+
+    def artifact_builder_must_not_run(_result):
+        raise AssertionError('self-check must not build review artifacts without the formal verifier')
+
+    monkeypatch.setattr(main_module, 'build_review_package', artifact_builder_must_not_run)
+
+    res = client.get('/api/v1/self-check')
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'fail'
+    assert data['checks']['z3_formal_verifier_available'] is False
+    assert data['checks']['z3_formal_verifier_operational'] is False
+    assert data['checks']['artifact_integrity'] is False
+
+
+def test_runtime_self_check_fails_closed_when_formal_verifier_runtime_breaks(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', True)
+    monkeypatch.setattr(main_module, 'verify_policy', lambda _policy: (False, ['runtime failure']))
+
+    res = client.get('/api/v1/self-check')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'fail'
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is False
+
+
+def test_runtime_self_check_fails_closed_when_formal_verifier_raises(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_Z3', True)
+
+    def broken_verifier(_policy):
+        raise RuntimeError('solver unavailable')
+
+    monkeypatch.setattr(main_module, 'verify_policy', broken_verifier)
+
+    res = client.get('/api/v1/self-check')
+
+    assert res.status_code == 503
+    data = res.json()
+    assert data['status'] == 'fail'
+    assert data['checks']['z3_formal_verifier_available'] is True
+    assert data['checks']['z3_formal_verifier_operational'] is False
+    assert data['checks']['artifact_integrity'] is False
+
+
+def test_lab_api_schema():
+    res = client.get('/api/v1/lab/run?seed=42&generations=2')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['final_policy']['verified'] is True
+    assert data['metrics']['benign_acceptance_rate'] >= 0.98
+
+
+def test_lab_rejects_out_of_bounds_inputs():
+    assert client.get('/api/v1/lab/run?seed=-1&generations=4').status_code == 422
+    assert client.get('/api/v1/lab/run?seed=42&generations=99').status_code == 422

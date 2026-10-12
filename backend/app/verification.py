@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import math
+import re
+import threading
+
+try:
+    from z3 import And, Real, Solver, sat, unsat
+    HAS_Z3 = True
+except ImportError:  # production requirements install z3-solver; verification fails closed without it
+    HAS_Z3 = False
+
+from .contracts import (
+    COMPILER_GENERATION_MAX,
+    COMPILER_GENERATION_MIN,
+    DEFAULT_MAX_FALSE_POSITIVE_RATE,
+    DEFAULT_MAX_POLICY_LATENCY_MS,
+    DEFAULT_Z3_TIMEOUT_MS,
+    POLICY_FIRST_TIME_CARD_RATIO_MAX,
+    POLICY_FIRST_TIME_CARD_RATIO_MIN,
+    POLICY_MERCHANT_AGE_HOURS_MAX,
+    POLICY_MERCHANT_AGE_HOURS_MIN,
+    POLICY_SETTLEMENT_CHANGE_DAYS_MAX,
+    POLICY_SETTLEMENT_CHANGE_DAYS_MIN,
+    POLICY_TEMPORAL_BURST_SCORE_MAX,
+    POLICY_TEMPORAL_BURST_SCORE_MIN,
+)
+from .policy import (
+    _COMPILER_AGE_CODES,
+    _COMPILER_BURST_PERCENT_CODES,
+    _COMPILER_CARD_PERCENT_CODES,
+    _COMPILER_ESTIMATED_LATENCY_MS,
+    _COMPILER_SETTLEMENT_CODES,
+)
+from .schemas import Policy
+
+ALLOWED_ACTIONS = {"PASS", "STEP_UP", "REVIEW"}
+_CANONICAL_POLICY_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+_COMPILER_POLICY_ID = re.compile(r"^ZD-(\d{2})-(\d{3})-(\d{2})-(\d{2})-(\d{2})$")
+_Z3_LOCK = threading.Lock()
+
+
+def _is_real_number(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _validate_budgets(max_fpr: float, max_latency_ms: float) -> tuple[bool, list[str]]:
+    """Keep verifier configuration within the shared business safety ceilings."""
+    if not _is_real_number(max_fpr):
+        return False, ["Verifier configuration invalid: max_fpr must be a real numeric value"]
+    if (
+        not math.isfinite(max_fpr)
+        or not 0 <= max_fpr <= DEFAULT_MAX_FALSE_POSITIVE_RATE
+    ):
+        return False, [
+            "Verifier configuration invalid: max_fpr must be finite and within "
+            f"[0, {DEFAULT_MAX_FALSE_POSITIVE_RATE:g}]"
+        ]
+    if not _is_real_number(max_latency_ms):
+        return False, ["Verifier configuration invalid: max_latency_ms must be a real numeric value"]
+    if (
+        not math.isfinite(max_latency_ms)
+        or not 0 < max_latency_ms <= DEFAULT_MAX_POLICY_LATENCY_MS
+    ):
+        return False, [
+            "Verifier configuration invalid: max_latency_ms must be finite and within "
+            f"(0, {DEFAULT_MAX_POLICY_LATENCY_MS:g}]"
+        ]
+    return True, []
+
+
+def _validate_policy_identity(policy: Policy) -> tuple[bool, list[str]]:
+    """Require a durable, ASCII-safe policy identity at the verification boundary."""
+    if not isinstance(policy.policy_id, str) or not policy.policy_id.strip():
+        return False, ["Policy identity invalid: policy_id must be a non-empty string"]
+    if len(policy.policy_id) > 80:
+        return False, ["Policy identity invalid: policy_id must be at most 80 characters"]
+    if _CANONICAL_POLICY_ID.fullmatch(policy.policy_id) is None:
+        return False, [
+            "Policy identity invalid: policy_id may contain only ASCII letters, digits, '.', '_', and '-'"
+        ]
+    if not any(char.isalnum() for char in policy.policy_id):
+        return False, ["Policy identity invalid: policy_id must contain at least one ASCII letter or digit"]
+    return True, []
+
+
+def _validate_compiler_identity_binding(policy: Policy) -> tuple[bool, list[str]]:
+    """Bind compiler-style ZD identities to semantics the native compiler can emit.
+
+    Generic external policy IDs remain supported, but any ID claiming compiler lineage via
+    the ``ZD-`` prefix (case-insensitive) must use the compiler's exact canonical identity
+    layout, retain the compiler's STEP_UP action and latency claim, encode one of the native
+    search-grid threshold tuples, and describe the actual policy thresholds presented to the
+    verifier. This prevents post-synthesis mutation and fabricated compiler provenance.
+    """
+    if not policy.policy_id.upper().startswith("ZD-"):
+        return True, []
+
+    match = _COMPILER_POLICY_ID.fullmatch(policy.policy_id)
+    if match is None:
+        return False, ["Compiler policy identity invalid: malformed ZD policy_id"]
+
+    generation, age, card_percent, settle, burst_percent = (int(value) for value in match.groups())
+    if not COMPILER_GENERATION_MIN <= generation <= COMPILER_GENERATION_MAX:
+        return False, [
+            "Compiler policy identity invalid: generation must be within "
+            f"[{COMPILER_GENERATION_MIN}, {COMPILER_GENERATION_MAX}]"
+        ]
+    if (
+        age not in _COMPILER_AGE_CODES
+        or card_percent not in _COMPILER_CARD_PERCENT_CODES
+        or settle not in _COMPILER_SETTLEMENT_CODES
+        or burst_percent not in _COMPILER_BURST_PERCENT_CODES
+    ):
+        return False, [
+            "Compiler policy identity invalid: thresholds are outside the native compiler search grid"
+        ]
+    if policy.action != "STEP_UP":
+        return False, [
+            "Compiler policy identity mismatch: ZD policies must retain the compiler STEP_UP action"
+        ]
+    if float(policy.estimated_latency_ms) != _COMPILER_ESTIMATED_LATENCY_MS:
+        return False, [
+            "Compiler policy identity mismatch: ZD policies must retain the compiler estimated latency"
+        ]
+
+    expected = (
+        float(age),
+        card_percent / 100,
+        float(settle),
+        burst_percent / 100,
+    )
+    actual = (
+        float(policy.merchant_age_max),
+        float(policy.first_time_card_ratio_min),
+        float(policy.settlement_change_days_max),
+        float(policy.temporal_burst_score_min),
+    )
+    if actual != expected:
+        return False, [
+            "Compiler policy identity mismatch: ZD policy_id does not encode the verified thresholds"
+        ]
+    return True, []
+
+
+def _validate_policy_action(policy: Policy) -> tuple[bool, list[str]]:
+    """Reject schema-bypassed action values before allow-list membership checks."""
+    if not isinstance(policy.action, str):
+        return False, ["Policy action invalid: action must be a string"]
+    if policy.action not in ALLOWED_ACTIONS:
+        return False, ["Action is not allowed"]
+    if policy.action == "PASS":
+        return False, ["Compiled fraud defences may not use PASS as the triggered action"]
+    return True, []
+
+
+def _validate_policy_numeric_fields(policy: Policy) -> tuple[bool, list[str]]:
+    """Fail closed if schema-bypassed policy numerics are malformed."""
+    bounded_fields = {
+        "merchant_age_max": (
+            policy.merchant_age_max,
+            POLICY_MERCHANT_AGE_HOURS_MIN,
+            POLICY_MERCHANT_AGE_HOURS_MAX,
+        ),
+        "first_time_card_ratio_min": (
+            policy.first_time_card_ratio_min,
+            POLICY_FIRST_TIME_CARD_RATIO_MIN,
+            POLICY_FIRST_TIME_CARD_RATIO_MAX,
+        ),
+        "settlement_change_days_max": (
+            policy.settlement_change_days_max,
+            POLICY_SETTLEMENT_CHANGE_DAYS_MIN,
+            POLICY_SETTLEMENT_CHANGE_DAYS_MAX,
+        ),
+        "temporal_burst_score_min": (
+            policy.temporal_burst_score_min,
+            POLICY_TEMPORAL_BURST_SCORE_MIN,
+            POLICY_TEMPORAL_BURST_SCORE_MAX,
+        ),
+        "fraud_coverage": (policy.fraud_coverage, 0.0, 1.0),
+        "false_positive_rate": (policy.false_positive_rate, 0.0, 1.0),
+    }
+    for name, (value, lower, upper) in bounded_fields.items():
+        if not _is_real_number(value):
+            return False, [f"Policy numeric field invalid: {name} must be a real numeric value"]
+        if not math.isfinite(value) or not lower <= value <= upper:
+            return False, [f"Policy numeric field invalid: {name} must be finite and within [{lower:g}, {upper:g}]"]
+
+    if not _is_real_number(policy.estimated_latency_ms):
+        return False, ["Policy numeric field invalid: estimated_latency_ms must be a real numeric value"]
+    if not math.isfinite(policy.estimated_latency_ms) or policy.estimated_latency_ms < 0:
+        return False, ["Policy numeric field invalid: estimated_latency_ms must be finite and >= 0"]
+    if type(policy.counterexamples_remaining) is not int or policy.counterexamples_remaining < 0:
+        return False, ["Policy numeric field invalid: counterexamples_remaining must be a non-negative integer"]
+    return True, []
+
+
+def verify_policy(
+    policy: Policy,
+    max_fpr: float = DEFAULT_MAX_FALSE_POSITIVE_RATE,
+    max_latency_ms: float = DEFAULT_MAX_POLICY_LATENCY_MS,
+) -> tuple[bool, list[str]]:
+    """Verify policy governance, business budgets, and formal feature-domain consistency.
+
+    The empirical counterexample count is reported as robustness evidence, not promoted to
+    a formal proof obligation. A nonzero count therefore does not invalidate Z3/domain or
+    business-budget verification; callers must preserve the count alongside benchmark ASR.
+    """
+    budgets_ok, budget_notes = _validate_budgets(max_fpr, max_latency_ms)
+    if not budgets_ok:
+        return False, budget_notes
+
+    identity_ok, identity_notes = _validate_policy_identity(policy)
+    if not identity_ok:
+        return False, identity_notes
+
+    action_ok, action_notes = _validate_policy_action(policy)
+    if not action_ok:
+        return False, action_notes
+
+    policy_numbers_ok, policy_number_notes = _validate_policy_numeric_fields(policy)
+    if not policy_numbers_ok:
+        return False, policy_number_notes
+
+    compiler_identity_ok, compiler_identity_notes = _validate_compiler_identity_binding(policy)
+    if not compiler_identity_ok:
+        return False, compiler_identity_notes
+
+    notes: list[str] = []
+    if policy.false_positive_rate > max_fpr:
+        return False, ["False-positive budget exceeded"]
+    if policy.estimated_latency_ms > max_latency_ms:
+        return False, [
+            f"Estimated policy latency {policy.estimated_latency_ms:.2f} ms exceeds "
+            f"the configured {max_latency_ms:.2f} ms budget"
+        ]
+
+    if not HAS_Z3:
+        return False, ["Formal verification unavailable: z3-solver is required"]
+
+    try:
+        # Z3's default global context is process-wide. FastAPI executes synchronous
+        # endpoints in a worker thread pool, so concurrent readiness/demo requests can
+        # otherwise enter the native solver at the same time and crash the process.
+        # Keep the formal boundary fail-closed by serializing access to that context.
+        with _Z3_LOCK:
+            age = Real("age")
+            card = Real("card")
+            settle = Real("settle")
+            burst = Real("burst")
+            solver = Solver()
+            solver.set(timeout=DEFAULT_Z3_TIMEOUT_MS)
+            solver.add(And(age >= POLICY_MERCHANT_AGE_HOURS_MIN, age <= POLICY_MERCHANT_AGE_HOURS_MAX))
+            solver.add(And(card >= POLICY_FIRST_TIME_CARD_RATIO_MIN, card <= POLICY_FIRST_TIME_CARD_RATIO_MAX))
+            solver.add(
+                And(
+                    settle >= POLICY_SETTLEMENT_CHANGE_DAYS_MIN,
+                    settle <= POLICY_SETTLEMENT_CHANGE_DAYS_MAX,
+                )
+            )
+            solver.add(
+                And(
+                    burst >= POLICY_TEMPORAL_BURST_SCORE_MIN,
+                    burst <= POLICY_TEMPORAL_BURST_SCORE_MAX,
+                )
+            )
+            solver.add(age <= policy.merchant_age_max)
+            solver.add(card >= policy.first_time_card_ratio_min)
+            solver.add(settle <= policy.settlement_change_days_max)
+            solver.add(burst >= policy.temporal_burst_score_min)
+            solver_result = solver.check()
+    except Exception:
+        return False, ["Formal verification failed closed: Z3 runtime error"]
+
+    if solver_result == unsat:
+        return False, ["Policy conditions are unsatisfiable"]
+    if solver_result != sat:
+        return False, ["Formal verification inconclusive: Z3 did not return sat or unsat"]
+    formal_note = "Z3: policy is satisfiable over valid payment-feature domains."
+
+    notes.extend(
+        [
+            formal_note,
+            f"False-positive rate {policy.false_positive_rate:.2%} is within {max_fpr:.2%} budget.",
+            f"Estimated policy latency {policy.estimated_latency_ms:.2f} ms is within {max_latency_ms:.2f} ms budget.",
+            (
+                f"Empirical counterexamples reported: {policy.counterexamples_remaining}; "
+                "this is robustness evidence, not a formal zero-counterexample proof."
+            ),
+            "Triggered action is step-up/review only; no autonomous hard decline is emitted.",
+            "Policy uses operational payment features only; no protected demographic attributes are present.",
+        ]
+    )
+    return True, notes

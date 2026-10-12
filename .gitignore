@@ -1,0 +1,22 @@
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+.next/
+.env
+.env.*
+*.pyc
+.DS_Store
+coverage.xml
+
+# Monad testnet private key and generated artifacts
+.env
+.env.*
+!.env.example
+!*.env.example
+node_modules/
+artifacts/
+cache/
+web3-dist/
+coverage/
+*.log

@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import re
+from typing import Literal
+
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
+
+from .contracts import (
+    COMPILER_GENERATION_MAX,
+    COMPILER_GENERATION_MIN,
+    DEFAULT_MAX_FALSE_POSITIVE_RATE,
+    DEFAULT_MAX_POLICY_LATENCY_MS,
+)
+
+Action = Literal["PASS", "STEP_UP", "REVIEW"]
+ApprovalStatus = Literal["HUMAN_APPROVAL_REQUIRED", "APPROVED", "REJECTED"]
+DeploymentStatus = Literal["NOT_DEPLOYED", "CANARY", "ROLLED_BACK"]
+_CANONICAL_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _reject_boolean_numeric_input(value: object) -> object:
+    """Prevent bool-as-number coercion at safety-critical schema boundaries."""
+    if isinstance(value, bool):
+        raise ValueError("boolean values are not valid numeric evidence")
+    return value
+
+
+def _require_canonical_attack_family(value: str) -> str:
+    """Require unambiguous non-benign provenance for judge-facing attack evidence."""
+    if any(char.isspace() for char in value):
+        raise ValueError("attack_family must not contain whitespace")
+    if value == "benign":
+        raise ValueError("attack_family must identify a non-benign synthetic attack family")
+    return value
+
+
+def _require_canonical_id(name: str, value: str) -> str:
+    """Keep durable identities ASCII-safe and aligned across schema and verification boundaries."""
+    if _CANONICAL_ID.fullmatch(value) is None:
+        raise ValueError(f"{name} may contain only ASCII letters, digits, '.', '_', and '-'")
+    if not any(char.isascii() and char.isalnum() for char in value):
+        raise ValueError(f"{name} must contain at least one ASCII letter or digit")
+    return value
+
+
+class Transaction(BaseModel):
+    """Synthetic transaction features used by the defensive laboratory."""
+
+    tx_id: str = Field(min_length=1, max_length=64)
+    amount: float = Field(ge=0, allow_inf_nan=False)
+    merchant_age_hours: float = Field(ge=0, allow_inf_nan=False)
+    first_time_card_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
+    settlement_change_days: float = Field(ge=0, allow_inf_nan=False)
+    temporal_burst_score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    device_entropy: float = Field(ge=0, le=1, allow_inf_nan=False)
+    geo_velocity: float = Field(ge=0, allow_inf_nan=False)
+    label: int = Field(ge=0, le=1, strict=True)
+    attack_family: str = Field(default="benign", min_length=1, max_length=64)
+
+    @field_validator("tx_id")
+    @classmethod
+    def require_canonical_transaction_id(cls, value: str) -> str:
+        return _require_canonical_id("tx_id", value)
+
+    @field_validator("attack_family")
+    @classmethod
+    def require_canonical_transaction_family(cls, value: str) -> str:
+        if any(char.isspace() for char in value):
+            raise ValueError("attack_family must not contain whitespace")
+        return value
+
+    @field_validator(
+        "amount",
+        "merchant_age_hours",
+        "first_time_card_ratio",
+        "settlement_change_days",
+        "temporal_burst_score",
+        "device_entropy",
+        "geo_velocity",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numeric_features(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+    @model_validator(mode="after")
+    def require_consistent_transaction_provenance(self) -> "Transaction":
+        if self.label == 0 and self.attack_family != "benign":
+            raise ValueError("benign transactions must use the benign attack_family provenance label")
+        if self.label == 1 and self.attack_family == "benign":
+            raise ValueError("attack transactions must identify a non-benign attack_family")
+        return self
+
+
+class Policy(BaseModel):
+    """Compact human-reviewable policy emitted by the defence compiler."""
+
+    policy_id: str = Field(min_length=1, max_length=80)
+    merchant_age_max: float = Field(ge=0, le=24 * 365 * 20)
+    first_time_card_ratio_min: float = Field(ge=0, le=1)
+    settlement_change_days_max: float = Field(ge=0, le=3650)
+    temporal_burst_score_min: float = Field(ge=0, le=1)
+    action: Action = "STEP_UP"
+    fraud_coverage: float = Field(default=0.0, ge=0, le=1)
+    false_positive_rate: float = Field(default=0.0, ge=0, le=1)
+    estimated_latency_ms: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    counterexamples_remaining: int = Field(default=0, ge=0, strict=True)
+    verified: StrictBool = False
+    explanation: str = Field(default="", max_length=1000)
+
+    @field_validator("policy_id")
+    @classmethod
+    def require_canonical_policy_id(cls, value: str) -> str:
+        """Keep policy identity canonical before it reaches provenance or verification."""
+        return _require_canonical_id("policy_id", value)
+
+    @field_validator(
+        "merchant_age_max",
+        "first_time_card_ratio_min",
+        "settlement_change_days_max",
+        "temporal_burst_score_min",
+        "fraud_coverage",
+        "false_positive_rate",
+        "estimated_latency_ms",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numeric_fields(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+
+class CounterexampleTrace(BaseModel):
+    """Audit-friendly summary of escaped synthetic variants for one generation."""
+
+    training_attack_count: int = Field(ge=1, strict=True)
+    redteam_attack_count: int = Field(ge=1, strict=True)
+    escaped_count: int = Field(ge=0, strict=True)
+    escaped_rate: float = Field(ge=0, le=1)
+    sample_tx_ids: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("escaped_rate", mode="before")
+    @classmethod
+    def reject_boolean_escaped_rate(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+    @field_validator("sample_tx_ids")
+    @classmethod
+    def require_valid_sample_identities(cls, value: list[str]) -> list[str]:
+        try:
+            for tx_id in value:
+                if not tx_id or len(tx_id) > 64:
+                    raise ValueError
+                _require_canonical_id("sample_tx_ids entry", tx_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "sample_tx_ids must contain canonical ASCII transaction IDs of at most 64 characters"
+            ) from None
+        if len(set(value)) != len(value):
+            raise ValueError("sample_tx_ids must not contain duplicate transaction IDs")
+        return value
+
+    @model_validator(mode="after")
+    def require_consistent_escape_evidence(self) -> "CounterexampleTrace":
+        if self.escaped_count > self.redteam_attack_count:
+            raise ValueError("escaped_count cannot exceed redteam_attack_count")
+        expected_rate = round(self.escaped_count / self.redteam_attack_count, 4)
+        if self.escaped_rate != expected_rate:
+            raise ValueError("escaped_rate must equal escaped_count / redteam_attack_count rounded to 4 decimals")
+        if len(self.sample_tx_ids) > self.escaped_count:
+            raise ValueError("sample_tx_ids cannot contain more entries than escaped_count")
+        return self
+
+
+class IterationResult(BaseModel):
+    iteration: int = Field(ge=1, strict=True)
+    candidate: Policy
+    counterexamples: int = Field(ge=0, strict=True)
+    attack_success_rate: float = Field(ge=0, le=1)
+    trace: CounterexampleTrace
+
+    @field_validator("attack_success_rate", mode="before")
+    @classmethod
+    def reject_boolean_attack_success_rate(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+    @model_validator(mode="after")
+    def require_trace_counterexample_consistency(self) -> "IterationResult":
+        if self.counterexamples != self.trace.escaped_count:
+            raise ValueError("counterexamples must equal trace.escaped_count")
+        if self.candidate.counterexamples_remaining != self.counterexamples:
+            raise ValueError("candidate.counterexamples_remaining must equal counterexamples")
+        if self.attack_success_rate != self.trace.escaped_rate:
+            raise ValueError("attack_success_rate must equal trace.escaped_rate")
+        expected_from_coverage = round(1 - self.candidate.fraud_coverage, 4)
+        if self.attack_success_rate != expected_from_coverage:
+            raise ValueError(
+                "attack_success_rate must equal one minus candidate.fraud_coverage rounded to 4 decimals"
+            )
+        return self
+
+
+class LabMetrics(BaseModel):
+    attack_success_reduction: float = Field(ge=-1, le=1)
+    final_fraud_coverage: float = Field(ge=0, le=1)
+    final_false_positive_rate: float = Field(ge=0, le=1)
+    estimated_policy_latency_ms: float = Field(ge=0, allow_inf_nan=False)
+    benign_acceptance_rate: float = Field(ge=0, le=1)
+
+    @field_validator(
+        "attack_success_reduction",
+        "final_fraud_coverage",
+        "final_false_positive_rate",
+        "estimated_policy_latency_ms",
+        "benign_acceptance_rate",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_metric_fields(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+
+class LabResult(BaseModel):
+    attack_family: str = Field(min_length=1, max_length=64)
+    seed: int = Field(ge=0, strict=True)
+    baseline_attack_success_rate: float = Field(ge=0, le=1)
+    final_attack_success_rate: float = Field(ge=0, le=1)
+    iterations: list[IterationResult]
+    final_policy: Policy
+    verification_notes: list[str]
+    metrics: LabMetrics
+
+    @field_validator("attack_family")
+    @classmethod
+    def require_canonical_attack_family(cls, value: str) -> str:
+        return _require_canonical_attack_family(value)
+
+    @field_validator(
+        "baseline_attack_success_rate",
+        "final_attack_success_rate",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_result_rates(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+    @model_validator(mode="after")
+    def require_consistent_final_evidence(self) -> "LabResult":
+        if not self.iterations:
+            raise ValueError("iterations must contain at least one result")
+        expected_iterations = list(range(1, len(self.iterations) + 1))
+        observed_iterations = [item.iteration for item in self.iterations]
+        if observed_iterations != expected_iterations:
+            raise ValueError("iterations must be contiguous and ordered starting at 1")
+        last = self.iterations[-1]
+        if self.final_policy != last.candidate:
+            raise ValueError("final_policy must equal the last iteration candidate")
+        if self.final_attack_success_rate != last.attack_success_rate:
+            raise ValueError("final_attack_success_rate must equal the last iteration attack_success_rate")
+        if self.metrics.final_fraud_coverage != self.final_policy.fraud_coverage:
+            raise ValueError("metrics.final_fraud_coverage must equal final_policy.fraud_coverage")
+        if self.metrics.final_false_positive_rate != self.final_policy.false_positive_rate:
+            raise ValueError("metrics.final_false_positive_rate must equal final_policy.false_positive_rate")
+        if self.metrics.estimated_policy_latency_ms != self.final_policy.estimated_latency_ms:
+            raise ValueError("metrics.estimated_policy_latency_ms must equal final_policy.estimated_latency_ms")
+        expected_reduction = round(self.baseline_attack_success_rate - self.final_attack_success_rate, 4)
+        if self.metrics.attack_success_reduction != expected_reduction:
+            raise ValueError("metrics.attack_success_reduction must equal baseline minus final attack success rate")
+        expected_acceptance = round(1 - self.final_policy.false_positive_rate, 4)
+        if self.metrics.benign_acceptance_rate != expected_acceptance:
+            raise ValueError("metrics.benign_acceptance_rate must equal one minus final false positive rate")
+        return self
+
+
+class CompilationProvenance(BaseModel):
+    """Deterministic metadata describing how a review artifact was produced."""
+
+    compiler_id: str = Field(min_length=1, max_length=80)
+    verifier_id: str = Field(min_length=1, max_length=80)
+    generation_count: int = Field(
+        ge=COMPILER_GENERATION_MIN,
+        le=COMPILER_GENERATION_MAX,
+        strict=True,
+    )
+    max_false_positive_rate: float = Field(ge=0, le=DEFAULT_MAX_FALSE_POSITIVE_RATE)
+    max_policy_latency_ms: float = Field(
+        gt=0,
+        le=DEFAULT_MAX_POLICY_LATENCY_MS,
+        allow_inf_nan=False,
+    )
+
+    @field_validator("compiler_id", "verifier_id")
+    @classmethod
+    def require_canonical_provenance_ids(cls, value: str, info) -> str:
+        """Prevent ambiguous Unicode or delimiter-bearing tool identities in review provenance."""
+        return _require_canonical_id(info.field_name, value)
+
+    @field_validator(
+        "max_false_positive_rate",
+        "max_policy_latency_ms",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_budget_fields(cls, value: object) -> object:
+        return _reject_boolean_numeric_input(value)
+
+
+class ReviewPackage(BaseModel):
+    """Immutable review handoff generated after synthesis and verification."""
+
+    package_version: Literal["1.2"] = "1.2"
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attack_family: str = Field(min_length=1, max_length=64)
+    seed: int = Field(ge=0, strict=True)
+    provenance: CompilationProvenance
+    policy: Policy
+    verification_notes: list[str] = Field(min_length=1)
+    approval_status: Literal["HUMAN_APPROVAL_REQUIRED"] = "HUMAN_APPROVAL_REQUIRED"
+    deployment_status: Literal["NOT_DEPLOYED"] = "NOT_DEPLOYED"
+    synthetic_only: Literal[True] = True
+    production_claim: Literal[False] = False
+
+    @field_validator("attack_family")
+    @classmethod
+    def require_canonical_attack_family(cls, value: str) -> str:
+        return _require_canonical_attack_family(value)
+
+    @field_validator("verification_notes")
+    @classmethod
+    def require_substantive_verification_notes(cls, value: list[str]) -> list[str]:
+        """Do not allow a review-ready handoff to claim verification without evidence text."""
+        if any(not note.strip() for note in value):
+            raise ValueError("verification_notes must contain only non-empty evidence strings")
+        return value
+
+    @model_validator(mode="after")
+    def require_verified_review_policy(self) -> "ReviewPackage":
+        """Fail closed if an unverified policy is wrapped as a review-ready artifact."""
+        if self.policy.verified is not True:
+            raise ValueError("review package policy must be verified")
+        return self

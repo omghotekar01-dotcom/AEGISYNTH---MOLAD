@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: aegisynth
+    runtime: docker
+    rootDir: backend
+    plan: free
+    healthCheckPath: /ready
