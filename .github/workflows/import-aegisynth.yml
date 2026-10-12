@@ -24,7 +24,7 @@ jobs:
             exit 0
           fi
           git clone --depth 1 --filter=blob:none https://github.com/omghotekar01-dotcom/Mastercard-project---AEGISYNTH.git "$RUNNER_TEMP/aegis-base"
-          rsync -a --exclude='.git/' "$RUNNER_TEMP/aegis-base/" ./
+          rsync -a --exclude='.git/' --exclude='.github/workflows/' "$RUNNER_TEMP/aegis-base/" ./
           printf '%s\n' 'Imported from omghotekar01-dotcom/Mastercard-project---AEGISYNTH at 2026-10-12 for Metropolis. Source authorship and original repository remain unchanged.' > .aegisynth-base-imported
           cat >> .gitignore <<'EOF'
 
